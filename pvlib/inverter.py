@@ -12,6 +12,7 @@ naming pattern 'fit_<model name>', e.g., fit_sandia.
 
 import numpy as np
 import pandas as pd
+from scipy import interpolate
 from numpy.polynomial.polynomial import polyfit  # different than np.polyfit
 
 
@@ -542,3 +543,225 @@ def fit_sandia(ac_power, dc_power, dc_voltage, dc_voltage_level, p_ac_0, p_nt):
     # prepare dict and return
     return {'Paco': p_ac_0, 'Pdco': p_dc0, 'Vdco': v_nom, 'Pso': p_s0,
             'C0': c0, 'C1': c1, 'C2': c2, 'C3': c3, 'Pnt': p_nt}
+
+
+def read_eff_profile(profile):
+    inv_eff_prof = pd.DataFrame(columns=['p_in', 'p_out', 'eff'])
+    for pt in profile:
+        if pt.startswith('Point_'):
+            pin = profile[pt][0]
+            pout = profile[pt][1]
+            if pin != 0 or pout != 0:
+                eff_data = [pin, pout, pout/pin]
+                inv_eff_prof.loc[pt] = eff_data
+
+    return inv_eff_prof
+
+
+def ond_eff(dc_p_mpp, dc_v_mpp, v_arr, i_arr, inverter, tamb=None, num_prof=3):
+    """
+    Uses the efficiency curves within an .ond file to simulate AC power
+    output.
+
+    Future development should include generated efficiency curves based
+    on CEC or EURO guidelines or adding inputs for user-entered
+    efficiency profiles. Or to handle multiple power point tracking
+
+    Parameters
+    ----------
+    dc_p_mpp :
+
+    dc_v_mpp :
+
+    v_arr :
+
+    i_arr :
+
+    inverter :
+
+    profiles : Integer
+        Must be 1 or 3. Selects which curves in the inverter file that the
+        efficiencies will be interpolated from. If 1 is entered the
+        efficiency is a
+
+    fbuf : File-like object # TODO: Update
+        Buffer of a .pan or .ond file
+
+    Returns
+    -------
+    comp : Nested Dictionary # TODO: Update
+        Contents of the .pan or .ond file following the indentation of the
+        file. The value of datatypes are assumed during reading. The value
+        units are the default used by PVsyst.
+
+    Raises
+    ------
+
+    Notes
+    -----
+
+    See Also
+    --------
+
+    References
+    ----------
+    """
+
+    # Shortening inverter component access for future code brevity
+    inv = inverter['PVObject_']['Converter']
+    # Parameters for efficiency curves
+    vNomEff = [item for item in inv['VNomEff'] if item != '']
+    efficMaxV= [item for item in inv['EfficMaxV'] if item != '']
+
+    # v_arr and i_arr need to be same dinemsions
+    # Moving funciton inputs to a more accessible data structure
+    p_arr = v_arr * i_arr
+    col_num = v_arr.shape[1]
+    col_v = ['v_' + str(i) for i in range(1, col_num + 1)]
+    col_i = ['i_' + str(i) for i in range(1, col_num + 1)]
+    col_p = [s.replace('i', 'p') for s in col_i]
+    df_v = pd.DataFrame(v_arr)
+    df_i = pd.DataFrame(i_arr)
+    # Calculating power for efficiency curves
+    df_p = df_v.mul(df_i, fill_value=1)
+    df_v.columns = col_v
+    df_i.columns = col_i
+    df_p.columns = col_p
+    df = pd.concat([dc_p_mpp, dc_v_mpp, df_v, df_i, df_p], axis=1)
+    df.index = dc_p_mpp.index
+
+    # Putting the efficiency profiles in their own dataframe
+    # If statement necessary to find the specific keys in the inverter
+    # dictionary as included in the .ond file
+    inv_eff_prof = {}
+    if num_prof == 3:
+        for profile in [inv['ProfilPIOV1'], inv['ProfilPIOV2'],
+                        inv['ProfilPIOV3']]:
+            # key = list(profile.keys())[0]
+            inv_eff_prof[list(profile.keys())[0]] = read_eff_profile(profile)
+
+    elif num_prof == 1:
+        inv_eff_prof['ProfilPIO'] = read_eff_profile(inv['ProfilPIO'])
+
+    # DC input limit - PVsyst uses PNom instead of what is listed as PMaxDC
+    # Using a boolean mask to limit the DC operating power point to PNomDC
+    if 'PNomDC' in inv:
+        # Conversion assumes default .ond units (kW)
+        df['dc_pnom'] = inv['PNomDC'] * 1000
+        df['dc_p_oper'] = inv['PNomDC'] * 1000
+        mask_pmax_in = df['dc_p_mpp'] < df['dc_p_oper']
+        df.loc[mask_pmax_in, 'dc_p_oper'] = df['dc_p_mpp']
+    else:
+        df['dc_p_oper'] = df['dc_p_mpp']
+
+    # AC derate for ambient temperature
+    # Pmax(T_amb) interpolation
+    if tamb is not None:
+        df['Tamb'] = tamb
+        df['ac_p_max'] = np.interp(df['Tamb'],
+                                   (inv['TPMax'], inv['TPNom'], inv['TPLim1'],
+                                    inv['TPLimAbs']),
+                                   (inv['PMaxOUT'] * 1000,
+                                    inv['PNomConv'] * 1000,
+                                    inv['PLim1'] * 1000,
+                                    inv['PLimAbs'] * 1000))
+    else:  # AC Pmax if no derate info
+        df['ac_p_max'] = inv['PMaxOUT'] * 1000
+
+    # Efficiency calculation
+    eta_v = [0] * len(inv_eff_prof['ProfilPIOV1']['p_out'])
+    eta_p = [0] * len(df['dc_v_mpp'])
+    df['eta'] = 0
+
+    # Iterate through interpolation at each time step. Could speed this up by
+    # limiting to daylight hours only or where dc_p_mpp is above minimum
+    # threshold for inverter
+    for dt, df_val in enumerate(df['dc_v_mpp']):  # dt represents the time step
+        p = df['dc_p_oper'][dt]
+
+    # Calc V at ImaxDC
+        i_shift = i_arr - inv['IMaxDC']
+        spline_i = interpolate.UnivariateSpline(v_arr[dt],
+                                                i_shift[dt],
+                                                s=0)
+        i_roots = spline_i.roots()
+        v_imax = i_roots[0] if len(v_imax) > 0 else v_imax 
+
+    # If operating voltage is < minimum inverter voltage then no power is produced
+        if df['dc_v_mpp'][dt] < inv['VMppMin']:
+            df['dc_p_oper'][dt] = 0
+            p = 0
+
+        else:
+            v_vmax = None
+            if df['dc_v_mpp'][dt] >= inv['VMppMin']:
+                v_vmax = inv['VMPPMax']
+
+            if p < df['dc_pnom'][dt]:
+                v_pmax = df['dc_v_mpp'][dt]
+
+            else:
+                p_shift = p_arr - df['dc_pnom'][dt]
+                spline_p = interpolate.UnivariateSpline(v_arr[dt],
+                                                        p_shift[dt],
+                                                        s=0)
+                p_roots = spline_p.roots()
+                v_pmax = max(p_roots)  # TODO: max() wouln't work if the p_oper is past Vmppmax
+        # TODO: v needs to be > VMppMin and <= VMppMax, otherwise set to the respective V lim
+        # TODO: incorporate IMaxDC - Find V of array at IMaxDC and take max(V_imaxdc, Vmpp)
+
+            if len(v_imax) == 0 and v_vmax is None:
+                # Do normal p_max
+                v = v_pmax
+            
+            elif len(v_imax) > 0 and v_vmax is None:
+                v = max(v_imax[0], v_pmax)
+
+            elif len(v_imax) == 0 and v_vmax is not None:
+                v = min(v_vmax, v_pmax)
+
+            elif len(v_imax) > 0 and v_vmax is not None:
+                # Complicated stuff
+                v_pmin = min(p_roots)
+                
+            
+
+                
+
+        if num_prof == 3:
+            for eff_pt, eff_pval in enumerate(inv_eff_prof['ProfilPIOV1']
+                                            ['p_out']):
+                eta_v[eff_pt] = np.interp(v,
+                                        vNomEff,
+                                        [inv_eff_prof['ProfilPIOV1']
+                                        ['eff'].iloc[eff_pt],
+                                        inv_eff_prof['ProfilPIOV2']
+                                        ['eff'].iloc[eff_pt],
+                                        inv_eff_prof['ProfilPIOV3']
+                                        ['eff'].iloc[eff_pt]])
+        elif num_prof == 1:
+            eta_v = inv_eff_prof['ProfilPIOV1']['eff']
+
+        f_eta_p = interpolate.interp1d(inv_eff_prof['ProfilPIOV1']['p_out'],
+                                        eta_v, fill_value='extrapolate')
+        eta_p[dt] = float(f_eta_p(p))
+
+    # Convert DC to AC by simple efficiency
+    df['eta'] = eta_p  # TODO: left off here
+    df['ac_p'] = df['eta'] * df['dc_p_oper']
+
+    # Inverter AC clipping
+    df['ac_p_oper'] = df['ac_p']
+    mask_pmax_T = df['ac_p'] > df['ac_p_max']
+    df.loc[mask_pmax_T, 'ac_p_oper'] = df['ac_p_max']
+
+    # TODO: add optional arg to create a single eff curve based on CEC or EURO eff
+    # if num_prof in ['CEC', 'EURO']:
+    #     ac_p = ond_eff_standard(dc_p_mpp, dc_v_mpp, inverter) #TODO: Should this be abstracted? Maybe this iff determines which curve is read into the DF?
+    #     return ac_p
+
+    # TODO: Checks to make sure the passed inverter parameters will work with the function
+
+    ac_p = df['ac_p_oper']
+
+    return ac_p
